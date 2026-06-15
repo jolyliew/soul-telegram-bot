@@ -5,6 +5,14 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const FINANCE_ID = process.env.FINANCE_SHEET_ID || "1nKHN5i08uaNne4PTNtXcANg5xjLkGNFTcC1nUCwetok";
 const LEADS_ID = process.env.LEADS_SHEET_ID || "1RMxVG9XHmJQz01TFuP5Rn_8SK6MhDvoPXZDuKcgXEyY";
 
+// Meta Ad Account IDs
+const META_ACCOUNTS = [
+  { id: "act_302857089030111", name: "叶涵3.0 MY" },
+  { id: "act_1153951549608625", name: "叶涵2.0 SG" },
+  { id: "act_1153172972825586", name: "晔涵1.0 LT" },
+];
+const META_TOKEN = process.env.META_ACCESS_TOKEN;
+
 function parseCsv(text) {
   const rows=[];let row=[],field="",inQuotes=false;
   for(let i=0;i<text.length;i++){const c=text[i];if(inQuotes){if(c==='"'){if(text[i+1]==='"'){field+='"';i++;}else inQuotes=false;}else field+=c;}else if(c==='"')inQuotes=true;else if(c===','){row.push(field);field="";}else if(c==='\n'){row.push(field);rows.push(row);row=[];field="";}else if(c!=='\r')field+=c;}
@@ -16,6 +24,31 @@ function toISO(raw){const p=parseDate(raw);if(!p)return null;return`${p.y}-${Str
 const MONTHS=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 function toMonthKey(raw){const p=parseDate(raw);if(!p)return null;return`${MONTHS[p.m-1]} ${p.y}`;}
 function findRow(rows,label,startAt=0){for(let i=startAt;i<rows.length;i++)if((rows[i][0]||"").trim().toLowerCase()===label.toLowerCase())return rows[i];return null;}
+
+// 从 Meta API 拿今日和本月 Ads Spend
+async function fetchMetaSpend(todayISO, monthStart) {
+  if (!META_TOKEN) return { todaySpend: null, monthSpend: null };
+  try {
+    let todaySpend = 0, monthSpend = 0;
+    for (const acc of META_ACCOUNTS) {
+      // 今日
+      const todayRes = await fetch(
+        `https://graph.facebook.com/v22.0/${acc.id}/insights?fields=spend&time_range={"since":"${todayISO}","until":"${todayISO}"}&access_token=${META_TOKEN}`
+      );
+      const todayJson = await todayRes.json();
+      todaySpend += num(todayJson?.data?.[0]?.spend || 0);
+      // 本月
+      const monthRes = await fetch(
+        `https://graph.facebook.com/v22.0/${acc.id}/insights?fields=spend&time_range={"since":"${monthStart}","until":"${todayISO}"}&access_token=${META_TOKEN}`
+      );
+      const monthJson = await monthRes.json();
+      monthSpend += num(monthJson?.data?.[0]?.spend || 0);
+    }
+    return { todaySpend, monthSpend };
+  } catch(e) {
+    return { todaySpend: null, monthSpend: null };
+  }
+}
 
 async function fetchData() {
   const csvUrl=(id,gid)=>`https://docs.google.com/spreadsheets/d/${id}/export?format=csv${gid?`&gid=${gid}`:""}`;
@@ -36,62 +69,80 @@ async function fetchData() {
     const nowMYT=new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Kuala_Lumpur'}));
     const thisMonthKey=`${MONTHS[nowMYT.getMonth()]} ${nowMYT.getFullYear()}`;
     const todayISO=`${nowMYT.getFullYear()}-${String(nowMYT.getMonth()+1).padStart(2,'0')}-${String(nowMYT.getDate()).padStart(2,'0')}`;
-    const dd = String(nowMYT.getDate()).padStart(2,'0');
-    const mm = String(nowMYT.getMonth()+1).padStart(2,'0');
-    const todayLabel = `${dd}/${mm}`;
+    const monthStart=`${nowMYT.getFullYear()}-${String(nowMYT.getMonth()+1).padStart(2,'0')}-01`;
+    const dd=String(nowMYT.getDate()).padStart(2,'0');
+    const mm=String(nowMYT.getMonth()+1).padStart(2,'0');
+    const todayLabel=`${dd}/${mm}`;
     const thisMonthLeads=leadRows.filter(r=>toMonthKey(r[0])===thisMonthKey).length;
+    const todayLeads=leadRows.filter(r=>toISO(r[0])===todayISO).length;
     const todaySales=salesRows.slice(1).filter(r=>toISO(r[0])===todayISO);
     const todayRevenue=todaySales.reduce((s,r)=>s+num(r[9]),0);
     const todayDeals=todaySales.length;
-    const todayLeads=leadRows.filter(r=>toISO(r[0])===todayISO).length;
-    // 本月总 deals
     const thisMonthSales=salesRows.slice(1).filter(r=>{const iso=toISO(r[0]);return iso&&iso.startsWith(todayISO.slice(0,7));});
     const totalMonthRevenue=thisMonthSales.reduce((s,r)=>s+num(r[9]),0);
     const totalMonthDeals=thisMonthSales.length;
-    return{months,latest,prev,allTimeTotal,leadsTotal:leadRows.length,thisMonthLeads,todayRevenue,todayDeals,todayLeads,totalMonthRevenue,totalMonthDeals,todayISO,thisMonthKey,todayLabel,error:null};
+    // Meta Ads Spend
+    const { todaySpend, monthSpend } = await fetchMetaSpend(todayISO, monthStart);
+    return{months,latest,prev,allTimeTotal,leadsTotal:leadRows.length,thisMonthLeads,todayRevenue,todayDeals,todayLeads,totalMonthRevenue,totalMonthDeals,todayISO,thisMonthKey,todayLabel,todaySpend,monthSpend,error:null};
   } catch(e){return{error:e.message};}
 }
 
+function fmt(n) { return n !== null && n !== undefined ? `RM ${Number(n).toLocaleString('en-MY', {minimumFractionDigits:2,maximumFractionDigits:2})}` : 'RM -'; }
+
 function buildReport(data) {
   if (data.error) return `数据读取失败：${data.error}`;
-  const todayCPL = data.todayLeads > 0 ? (data.todayRevenue / data.todayLeads).toFixed(2) : '-';
-  const overviewCPL = data.thisMonthLeads > 0 ? ((data.latest?.total||0) / data.thisMonthLeads).toFixed(2) : '-';
+
+  // CPL = Ads Spend / Leads
+  const todayCPL = (data.todaySpend !== null && data.todayLeads > 0)
+    ? `RM ${(data.todaySpend / data.todayLeads).toFixed(2)}` : 'RM -';
+  const overviewCPL = (data.monthSpend !== null && data.thisMonthLeads > 0)
+    ? `RM ${(data.monthSpend / data.thisMonthLeads).toFixed(2)}` : 'RM -';
+
+  // ROAS = Sales / Ads Spend
+  const todayROAS = (data.todaySpend !== null && data.todaySpend > 0 && data.todayRevenue > 0)
+    ? `${(data.todayRevenue / data.todaySpend).toFixed(2)}x` : '-';
+  const totalROAS = (data.monthSpend !== null && data.monthSpend > 0 && data.totalMonthRevenue > 0)
+    ? `${(data.totalMonthRevenue / data.monthSpend).toFixed(2)}x` : '-';
+
+  const todaySpendText = data.todaySpend !== null ? fmt(data.todaySpend) : 'RM - (Meta API)';
+  const monthSpendText = data.monthSpend !== null ? fmt(data.monthSpend) : 'RM - (Meta API)';
 
   return `📅 晔涵老师 | ${data.todayLabel} Daily Report
 
 ➖➖➖➖➖
 
-💰 Today Sales：RM ${data.todayRevenue.toLocaleString()}
-💰 Total Sales：RM ${(data.latest?.total||0).toLocaleString()}
+💰 Today Sales：${fmt(data.todayRevenue)}
+💰 Total Sales：${fmt(data.totalMonthRevenue)}
 💰 Today Done Deal：${data.todayDeals}
 💰 Total Done Deal：${data.totalMonthDeals}
 
 🔥 Today Lead：${data.todayLeads}
 🔥 Total Leads：${data.thisMonthLeads}
-🔥 Today CPL：RM ${todayCPL}
+🔥 Today CPL：${todayCPL}
 
-⚙️ Today Ads Spend：RM - (Meta API)
-⚙️ Total Ads Spend：RM - (Meta API)
-⚙️ Overview CPL：RM ${overviewCPL}
-⚙️ Total ROAS：-`;
+⚙️ Today Ads Spend：${todaySpendText}
+⚙️ Total Ads Spend：${monthSpendText}
+⚙️ Overview CPL：${overviewCPL}
+⚙️ Total ROAS：${totalROAS}`;
 }
 
 async function sendTelegram(text, chatId) {
   await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
     method:"POST", headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({chat_id:chatId||CHAT_ID, text: text})
+    body:JSON.stringify({chat_id:chatId||CHAT_ID, text})
   });
 }
 
 async function askClaude(question, data) {
   if (!ANTHROPIC_KEY) return buildReport(data);
-  const dataContext = data.error ? `数据暂时无法读取：${data.error}` : `
+  const dataContext = `
 实时数据：
-- 今日收入：RM ${data.todayRevenue}，今日新Leads：${data.todayLeads}人，今日成交：${data.todayDeals}单
+- 今日收入：RM ${data.todayRevenue}，今日Leads：${data.todayLeads}人，今日成交：${data.todayDeals}单
+- 今日Ads Spend：${data.todaySpend !== null ? 'RM '+data.todaySpend : '无数据'}
 - 本月(${data.thisMonthKey})：RM ${(data.latest?.total||0).toLocaleString()}，Leads ${data.thisMonthLeads}人，成交 ${data.totalMonthDeals}单
+- 本月Ads Spend：${data.monthSpend !== null ? 'RM '+data.monthSpend : '无数据'}
 - 上月：RM ${(data.prev?.total||0).toLocaleString()}
 - 历史累计：RM ${data.allTimeTotal.toLocaleString()}，总Leads：${data.leadsTotal}人
-- 近6个月趋势：${data.months?.slice(-6).map(m=>`${m.month}:RM${m.total.toLocaleString()}`).join(' | ')}
   `;
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -99,9 +150,7 @@ async function askClaude(question, data) {
       headers:{"Content-Type":"application/json","x-api-key":ANTHROPIC_KEY,"anthropic-version":"2023-06-01"},
       body:JSON.stringify({
         model:"claude-sonnet-4-6", max_tokens:800,
-        system:`你是晔涵灵魂学的AI操盘手助理。项目背景：马来西亚华人灵性教育，产品线从RM93到RM35,629。
-用马来西亚华人口语，直接精准，不废话，给具体可行建议。回复限300字以内。不要用任何markdown格式，纯文字回复。
-${dataContext}`,
+        system:`你是晔涵灵魂学的AI操盘手助理。马来西亚华人灵性教育，产品线RM93到RM35,629。用马来西亚华人口语，直接精准，不废话，给具体可行建议。限300字，纯文字不用markdown。${dataContext}`,
         messages:[{role:"user",content:question}]
       })
     });
@@ -112,37 +161,28 @@ ${dataContext}`,
 
 export default async function handler(req, res) {
   if (req.method !== "POST") { res.status(200).send("Bot 运行中"); return; }
-
   const update = req.body;
   const message = update?.message;
   if (!message) { res.status(200).json({ok:true}); return; }
-
   const chatId = message.chat?.id;
   const text = message.text || "";
-
   if (String(chatId) !== String(CHAT_ID)) {
     await sendTelegram("未授权", chatId);
     res.status(200).json({ok:true});
     return;
   }
-
-  // /start — 简化版
   if (text === "/start") {
     await sendTelegram(`晔涵灵魂学 AI 指挥官 已启动 ✅\n每晚 11:59PM 自动发报告给你。`, chatId);
     res.status(200).json({ok:true});
     return;
   }
-
-  // 今日报告
-  if (text === "今日报告" || text === "/report" || text === "本月业绩" || text === "报告") {
+  if (["今日报告","/report","本月业绩","报告"].includes(text)) {
     await sendTelegram("读取数据中...", chatId);
     const data = await fetchData();
     await sendTelegram(buildReport(data), chatId);
     res.status(200).json({ok:true});
     return;
   }
-
-  // AI 回复
   await sendTelegram("分析中...", chatId);
   const data = await fetchData();
   const reply = await askClaude(text, data);
