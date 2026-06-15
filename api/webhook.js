@@ -7,7 +7,6 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const FINANCE_ID = process.env.FINANCE_SHEET_ID || "1nKHN5i08uaNne4PTNtXcANg5xjLkGNFTcC1nUCwetok";
 const LEADS_ID = process.env.LEADS_SHEET_ID || "1RMxVG9XHmJQz01TFuP5Rn_8SK6MhDvoPXZDuKcgXEyY";
 
-// [数据获取函数与 daily-report.js 相同，复用]
 function parseCsv(text) {
   const rows=[];let row=[],field="",inQuotes=false;
   for(let i=0;i<text.length;i++){const c=text[i];if(inQuotes){if(c==='"'){if(text[i+1]==='"'){field+='"';i++;}else inQuotes=false;}else field+=c;}else if(c==='"')inQuotes=true;else if(c===','){row.push(field);field="";}else if(c==='\n'){row.push(field);rows.push(row);row=[];field="";}else if(c!=='\r')field+=c;}
@@ -47,20 +46,22 @@ async function fetchData() {
   } catch(e){return{error:e.message};}
 }
 
+// 修复：用纯文字发送，不用 Markdown 避免特殊字符报错
 async function sendTelegram(text, chatId) {
+  const cleanText = text.replace(/[*_`\[\]()~>#+=|{}.!-]/g, '\\$&');
   await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
     method:"POST", headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({chat_id:chatId||CHAT_ID,text,parse_mode:"Markdown"})
+    body:JSON.stringify({chat_id:chatId||CHAT_ID, text: text, parse_mode: ""})
   });
 }
 
 async function askClaude(question, data) {
-  if (!ANTHROPIC_KEY) return "❌ 未配置 Claude API Key";
+  if (!ANTHROPIC_KEY) return "未配置 Claude API Key，但数据读取正常。\n\n" + buildDataSummary(data);
   const dataContext = data.error ? `数据暂时无法读取：${data.error}` : `
 实时数据：
 - 今日收入：RM ${data.todayRevenue.toLocaleString()}，今日新Leads：${data.todayLeads}人
-- 本月(${data.thisMonthKey})：RM ${data.latest?.total?.toLocaleString()}，Leads ${data.thisMonthLeads}人
-- 上月：RM ${data.prev?.total?.toLocaleString()||0}
+- 本月(${data.thisMonthKey})：RM ${(data.latest?.total||0).toLocaleString()}，Leads ${data.thisMonthLeads}人
+- 上月：RM ${(data.prev?.total||0).toLocaleString()}
 - 历史累计：RM ${data.allTimeTotal.toLocaleString()}，总Leads：${data.leadsTotal}人
 - 近6个月趋势：${data.months?.slice(-6).map(m=>`${m.month}:RM${m.total.toLocaleString()}`).join(' | ')}
   `;
@@ -71,18 +72,38 @@ async function askClaude(question, data) {
       body:JSON.stringify({
         model:"claude-sonnet-4-6", max_tokens:800,
         system:`你是晔涵灵魂学的AI操盘手助理。项目背景：马来西亚华人灵性教育，产品线从RM93到RM35,629。
-用马来西亚华人口语，直接精准，不废话，给具体可行建议。回复限300字以内。
+用马来西亚华人口语，直接精准，不废话，给具体可行建议。回复限300字以内。不要用任何markdown格式，纯文字回复。
 ${dataContext}`,
         messages:[{role:"user",content:question}]
       })
     });
     const json=await res.json();
-    return json.content?.[0]?.text||"❌ AI分析失败";
-  } catch(e){return `❌ 出错：${e.message}`;}
+    return json.content?.[0]?.text||"AI分析失败，请稍后再试。";
+  } catch(e){return `出错：${e.message}`;}
+}
+
+function buildDataSummary(data) {
+  if (data.error) return `数据读取失败：${data.error}`;
+  const mom = data.latest && data.prev && data.prev.total > 0
+    ? ((data.latest.total-data.prev.total)/data.prev.total*100).toFixed(1) : null;
+  const momText = mom !== null ? (parseFloat(mom)>=0?`+${mom}% vs 上月`:`${mom}% vs 上月`) : "";
+  return `今日报告
+
+今日收入：RM ${data.todayRevenue.toLocaleString()}
+今日新 Leads：${data.todayLeads} 人
+
+${data.thisMonthKey} 本月累计
+Front End：RM ${(data.latest?.frontEnd||0).toLocaleString()}
+Up-sell：RM ${(data.latest?.upsell||0).toLocaleString()}
+总收入：RM ${(data.latest?.total||0).toLocaleString()} ${momText}
+本月 Leads：${data.thisMonthLeads} 人
+
+历史累计：RM ${data.allTimeTotal.toLocaleString()}
+总 Leads：${data.leadsTotal} 人`;
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") { res.status(200).send("Bot 运行中 ✅"); return; }
+  if (req.method !== "POST") { res.status(200).send("Bot 运行中"); return; }
 
   const update = req.body;
   const message = update?.message;
@@ -91,54 +112,38 @@ export default async function handler(req, res) {
   const chatId = message.chat?.id;
   const text = message.text || "";
 
-  // 安全验证：只响应你自己
   if (String(chatId) !== String(CHAT_ID)) {
-    await sendTelegram("⚠️ 未授权", chatId);
+    await sendTelegram("未授权", chatId);
     res.status(200).json({ok:true});
     return;
   }
 
-  // 快捷指令
   if (text === "/start") {
-    await sendTelegram(`👋 你好 Joly！
+    await sendTelegram(`你好 Joly！
 
-我是你的 *晔涵灵魂学 AI 指挥官* 🧠
+我是你的晔涵灵魂学 AI 指挥官
 
-你可以问我任何关于项目的问题：
-• 「今日报告」— 查看今日数据
-• 「本月业绩」— 本月收入分析  
-• 「Leads 分析」— Lead 数据
-• 「下一步该怎么做」— AI 策略建议
-• 或者任何其他问题！
+你可以问我：
+- 今日报告
+- 本月业绩
+- Leads 分析
+- 下一步该怎么做
+- 或者任何其他问题
 
-每晚 *11:59PM* 我会自动发报告给你 🌙`, chatId);
+每晚 11:59PM 我会自动发报告给你`, chatId);
     res.status(200).json({ok:true});
     return;
   }
 
-  if (text === "今日报告" || text === "/report") {
-    await sendTelegram("⏳ 读取数据中...", chatId);
+  if (text === "今日报告" || text === "/report" || text === "本月业绩") {
+    await sendTelegram("读取数据中...", chatId);
     const data = await fetchData();
-    const mom = data.latest && data.prev && data.prev.total > 0
-      ? ((data.latest.total-data.prev.total)/data.prev.total*100).toFixed(1) : null;
-    const momText = mom !== null ? (parseFloat(mom)>=0?`📈 +${mom}%`:`📉 ${mom}%`) : "";
-    const report = `📊 *今日实时报告*
-
-💰 今日收入：RM ${data.todayRevenue.toLocaleString()}
-👥 今日新 Leads：${data.todayLeads} 人
-
-📊 ${data.thisMonthKey} 本月累计
-• 总收入：RM ${(data.latest?.total||0).toLocaleString()} ${momText}
-• 本月 Leads：${data.thisMonthLeads} 人
-
-🏆 历史累计：RM ${data.allTimeTotal.toLocaleString()}`;
-    await sendTelegram(report, chatId);
+    await sendTelegram(buildDataSummary(data), chatId);
     res.status(200).json({ok:true});
     return;
   }
 
-  // AI 回复所有其他问题
-  await sendTelegram("⏳ 分析中...", chatId);
+  await sendTelegram("分析中...", chatId);
   const data = await fetchData();
   const reply = await askClaude(text, data);
   await sendTelegram(reply, chatId);
