@@ -1,6 +1,4 @@
 // api/webhook.js
-// 接收 Telegram 消息，AI 分析后回复
-
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
@@ -38,29 +36,59 @@ async function fetchData() {
     const nowMYT=new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Kuala_Lumpur'}));
     const thisMonthKey=`${MONTHS[nowMYT.getMonth()]} ${nowMYT.getFullYear()}`;
     const todayISO=`${nowMYT.getFullYear()}-${String(nowMYT.getMonth()+1).padStart(2,'0')}-${String(nowMYT.getDate()).padStart(2,'0')}`;
+    const dd = String(nowMYT.getDate()).padStart(2,'0');
+    const mm = String(nowMYT.getMonth()+1).padStart(2,'0');
+    const todayLabel = `${dd}/${mm}`;
     const thisMonthLeads=leadRows.filter(r=>toMonthKey(r[0])===thisMonthKey).length;
     const todaySales=salesRows.slice(1).filter(r=>toISO(r[0])===todayISO);
     const todayRevenue=todaySales.reduce((s,r)=>s+num(r[9]),0);
+    const todayDeals=todaySales.length;
     const todayLeads=leadRows.filter(r=>toISO(r[0])===todayISO).length;
-    return{months,latest,prev,allTimeTotal,leadsTotal:leadRows.length,thisMonthLeads,todayRevenue,todayLeads,todayISO,thisMonthKey,error:null};
+    // 本月总 deals
+    const thisMonthSales=salesRows.slice(1).filter(r=>{const iso=toISO(r[0]);return iso&&iso.startsWith(todayISO.slice(0,7));});
+    const totalMonthRevenue=thisMonthSales.reduce((s,r)=>s+num(r[9]),0);
+    const totalMonthDeals=thisMonthSales.length;
+    return{months,latest,prev,allTimeTotal,leadsTotal:leadRows.length,thisMonthLeads,todayRevenue,todayDeals,todayLeads,totalMonthRevenue,totalMonthDeals,todayISO,thisMonthKey,todayLabel,error:null};
   } catch(e){return{error:e.message};}
 }
 
-// 修复：用纯文字发送，不用 Markdown 避免特殊字符报错
+function buildReport(data) {
+  if (data.error) return `数据读取失败：${data.error}`;
+  const todayCPL = data.todayLeads > 0 ? (data.todayRevenue / data.todayLeads).toFixed(2) : '-';
+  const overviewCPL = data.thisMonthLeads > 0 ? ((data.latest?.total||0) / data.thisMonthLeads).toFixed(2) : '-';
+
+  return `📅 晔涵老师 | ${data.todayLabel} Daily Report
+
+➖➖➖➖➖
+
+💰 Today Sales：RM ${data.todayRevenue.toLocaleString()}
+💰 Total Sales：RM ${(data.latest?.total||0).toLocaleString()}
+💰 Today Done Deal：${data.todayDeals}
+💰 Total Done Deal：${data.totalMonthDeals}
+
+🔥 Today Lead：${data.todayLeads}
+🔥 Total Leads：${data.thisMonthLeads}
+🔥 Today CPL：RM ${todayCPL}
+
+⚙️ Today Ads Spend：RM - (Meta API)
+⚙️ Total Ads Spend：RM - (Meta API)
+⚙️ Overview CPL：RM ${overviewCPL}
+⚙️ Total ROAS：-`;
+}
+
 async function sendTelegram(text, chatId) {
-  const cleanText = text.replace(/[*_`\[\]()~>#+=|{}.!-]/g, '\\$&');
   await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
     method:"POST", headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({chat_id:chatId||CHAT_ID, text: text, parse_mode: ""})
+    body:JSON.stringify({chat_id:chatId||CHAT_ID, text: text})
   });
 }
 
 async function askClaude(question, data) {
-  if (!ANTHROPIC_KEY) return "未配置 Claude API Key，但数据读取正常。\n\n" + buildDataSummary(data);
+  if (!ANTHROPIC_KEY) return buildReport(data);
   const dataContext = data.error ? `数据暂时无法读取：${data.error}` : `
 实时数据：
-- 今日收入：RM ${data.todayRevenue.toLocaleString()}，今日新Leads：${data.todayLeads}人
-- 本月(${data.thisMonthKey})：RM ${(data.latest?.total||0).toLocaleString()}，Leads ${data.thisMonthLeads}人
+- 今日收入：RM ${data.todayRevenue}，今日新Leads：${data.todayLeads}人，今日成交：${data.todayDeals}单
+- 本月(${data.thisMonthKey})：RM ${(data.latest?.total||0).toLocaleString()}，Leads ${data.thisMonthLeads}人，成交 ${data.totalMonthDeals}单
 - 上月：RM ${(data.prev?.total||0).toLocaleString()}
 - 历史累计：RM ${data.allTimeTotal.toLocaleString()}，总Leads：${data.leadsTotal}人
 - 近6个月趋势：${data.months?.slice(-6).map(m=>`${m.month}:RM${m.total.toLocaleString()}`).join(' | ')}
@@ -82,26 +110,6 @@ ${dataContext}`,
   } catch(e){return `出错：${e.message}`;}
 }
 
-function buildDataSummary(data) {
-  if (data.error) return `数据读取失败：${data.error}`;
-  const mom = data.latest && data.prev && data.prev.total > 0
-    ? ((data.latest.total-data.prev.total)/data.prev.total*100).toFixed(1) : null;
-  const momText = mom !== null ? (parseFloat(mom)>=0?`+${mom}% vs 上月`:`${mom}% vs 上月`) : "";
-  return `今日报告
-
-今日收入：RM ${data.todayRevenue.toLocaleString()}
-今日新 Leads：${data.todayLeads} 人
-
-${data.thisMonthKey} 本月累计
-Front End：RM ${(data.latest?.frontEnd||0).toLocaleString()}
-Up-sell：RM ${(data.latest?.upsell||0).toLocaleString()}
-总收入：RM ${(data.latest?.total||0).toLocaleString()} ${momText}
-本月 Leads：${data.thisMonthLeads} 人
-
-历史累计：RM ${data.allTimeTotal.toLocaleString()}
-总 Leads：${data.leadsTotal} 人`;
-}
-
 export default async function handler(req, res) {
   if (req.method !== "POST") { res.status(200).send("Bot 运行中"); return; }
 
@@ -118,31 +126,23 @@ export default async function handler(req, res) {
     return;
   }
 
+  // /start — 简化版
   if (text === "/start") {
-    await sendTelegram(`你好 Joly！
-
-我是你的晔涵灵魂学 AI 指挥官
-
-你可以问我：
-- 今日报告
-- 本月业绩
-- Leads 分析
-- 下一步该怎么做
-- 或者任何其他问题
-
-每晚 11:59PM 我会自动发报告给你`, chatId);
+    await sendTelegram(`晔涵灵魂学 AI 指挥官 已启动 ✅\n每晚 11:59PM 自动发报告给你。`, chatId);
     res.status(200).json({ok:true});
     return;
   }
 
-  if (text === "今日报告" || text === "/report" || text === "本月业绩") {
+  // 今日报告
+  if (text === "今日报告" || text === "/report" || text === "本月业绩" || text === "报告") {
     await sendTelegram("读取数据中...", chatId);
     const data = await fetchData();
-    await sendTelegram(buildDataSummary(data), chatId);
+    await sendTelegram(buildReport(data), chatId);
     res.status(200).json({ok:true});
     return;
   }
 
+  // AI 回复
   await sendTelegram("分析中...", chatId);
   const data = await fetchData();
   const reply = await askClaude(text, data);
